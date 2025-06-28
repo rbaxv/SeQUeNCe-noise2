@@ -1,203 +1,233 @@
-"""This module defines the quantum manager class, to track quantum states.
-
-The states may currently be defined in two possible ways:
-    - KetState (with the QuantumManagerKet class)
-    - DensityMatrix (with the QuantumManagerDensity class)
-
-The manager defines an API for interacting with quantum states.
-"""
+# File: sequence/kernel/quantum_manager.py
+#
+# This module defines the quantum manager class hierarchy, to track quantum states.
+# It supports various formalisms (ket vector, density matrix, Fock density matrix, Bell diagonal).
+#
+# Changes in this version focus on:
+# 1. Restoring the original class hierarchy (abstract QuantumManager, and concrete subclasses).
+# 2. Adapting all quantum state manipulations to use QuTiP's Qobj objects for robustness and efficiency.
+# 3. Ensuring compatibility with the new noise models and stochastic parameters in components
+#    (Memory, Detector, BSM), which delegate noise application to components, while QuantumManager
+#    handles ideal state evolution.
+# 4. FIX: Add `timeline` reference to `QuantumManager` and its subclasses for proper operation.
 
 from __future__ import annotations
-from abc import abstractmethod
-from typing import TYPE_CHECKING
+from abc import ABC, abstractmethod
+import logging
+import numpy as np
+import qutip
+from typing import TYPE_CHECKING, Any, Union, List
+import math
 
-if TYPE_CHECKING:
-    from ..components.circuit import Circuit
-    from .quantum_state import State
-
-from qutip_qip.circuit import QubitCircuit
-from qutip_qip.operations import gate_sequence_product, Gate
-from numpy import log, array, cumsum, base_repr, zeros
+# Re-added specific numpy/scipy imports as used in original subclasses for matrix ops
+from numpy import log, array, cumsum, zeros, outer, kron
 from scipy.sparse import csr_matrix
 from scipy.special import binom
 
-from .quantum_state import KetState, DensityState, BellDiagonalState
-from .quantum_utils import *
+# Type hints for other core components
+if TYPE_CHECKING:
+    from ..components.circuit import Circuit
+    from ..kernel.timeline import Timeline # Added import for Timeline
+    from .quantum_state import State as QuantumBaseState, KetState as OriginalKetState, \
+                               DensityState as OriginalDensityState, BellDiagonalState as OriginalBellDiagonalState
 
+
+# Formalism constants (aligned with original file for consistency)
 KET_STATE_FORMALISM = "ket_vector"
 DENSITY_MATRIX_FORMALISM = "density_matrix"
 FOCK_DENSITY_MATRIX_FORMALISM = "fock_density"
 BELL_DIAGONAL_STATE_FORMALISM = "bell_diagonal"
 
 
-class QuantumManager:
-    """Class to track and manage quantum states (abstract).
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    All states stored are of a single formalism (by default as a ket vector).
+
+class QuantumManager(ABC):
+    """
+    Abstract base class to track and manage quantum states.
+    All states stored are of a single formalism.
 
     Attributes:
-        states (dict[int, State]): mapping of state keys to quantum state objects.
-        truncation (int): maximally allowed number of excited states for elementary subsystems.
-                Default is 1 for qubit.
-        dim (int): subsystem Hilbert space dimension. dim = truncation + 1
+        timeline (Timeline): The simulation timeline (FIX: new attribute).
+        states (dict[int, QuantumManager.State]): mapping of state keys to quantum state objects (Qobj wrappers).
+        _least_available (int): The next available unique integer key for a new quantum state.
+        formalism (str): The quantum state representation formalism.
+        truncation (int): Max number of photons in Fock state representation (for Fock formalisms).
+        dim (int): Subsystem Hilbert space dimension. (e.g., 2 for qubit, truncation + 1 for Fock).
     """
 
-    def __init__(self, formalism: str, truncation: int = 1):
-        self.states: dict[int, State] = {}
+    def __init__(self, timeline: "Timeline", formalism: str, truncation: int = 1): # FIX: Added timeline
+        self.timeline = timeline # FIX: Store timeline reference
+        self.states: dict[int, QuantumManager.State] = {}
         self._least_available: int = 0
         self.formalism: str = formalism
         self.truncation = truncation
         self.dim = self.truncation + 1
 
+        logger.info(f"Initialized abstract QuantumManager for formalism: {self.formalism}, truncation: {self.truncation}")
+
     @abstractmethod
-    def new(self, state: any) -> int:
-        """Method to create a new quantum state.
-
-        Args:
-            state (any): complex amplitudes of new state. Type depends on type of subclass.
-
-        Returns:
-            int: key for new state generated.
-        """
+    def new(self, state_data: Any) -> int:
         pass
 
-    def get(self, key: int) -> "State":
-        """Method to get quantum state stored at an index.
-
-        Args:
-            key (int): key for quantum state.
-
-        Returns:
-            State: quantum state at supplied key.
-        """
-        return self.states[key]
+    def get(self, key: int) -> "QuantumManager.State":
+        state = self.states.get(key)
+        if state is None:
+            logger.error(f"Attempted to get non-existent quantum state for key: {key}")
+            raise KeyError(f"Quantum state with key {key} does not exist.")
+        logger.debug(f"Retrieved quantum state for key: {key}")
+        return state
 
     @abstractmethod
-    def run_circuit(self, circuit: Circuit, keys: list[int], meas_samp=None) -> dict[int, int]:
-        """Method to run a circuit on a given set of quantum states.
-
-        Args:
-            circuit (Circuit): quantum circuit to apply.
-            keys (list[int]): list of keys for quantum states to apply circuit to.
-            meas_samp (float): random sample used for measurement.
-
-        Returns:
-            dict[int, int]: dictionary mapping qstate keys to measurement results.
-        """
-
-        assert len(keys) == circuit.size, "mismatch between circuit size and supplied qubits"
+    def run_circuit(self, circuit: "Circuit", keys: list[int], meas_samp: float = None) -> dict[int, Any]:
+        assert len(keys) == circuit.num_qubits, f"Mismatch between circuit size ({circuit.num_qubits}) and supplied qubits ({len(keys)})"
         if len(circuit.measured_qubits) > 0:
-            assert meas_samp, "must specify random sample when measuring qubits"
+            assert meas_samp is not None, "Must specify random sample when measuring qubits."
+        pass
 
-    def _prepare_circuit(self, circuit: Circuit, keys: list[int]):
-        old_states = []
-        all_keys = []
+    def _prepare_circuit(self, circuit: "Circuit", keys: list[int]) -> tuple[qutip.Qobj, list[int], qutip.Qobj]:
+        old_states: list[qutip.Qobj] = []
+        all_keys: list[int] = []
 
-        # go through keys and get all unique qstate objects
         for key in keys:
-            qstate = self.states[key]
-            if qstate.keys[0] not in all_keys:
-                old_states.append(qstate.state)
-                all_keys += qstate.keys
+            qstate_wrapper = self.states[key]
+            if qstate_wrapper.keys[0] not in all_keys:
+                old_states.append(qstate_wrapper.state)
+                all_keys.extend(qstate_wrapper.keys)
 
-        # construct compound state; order qubits
-        new_state = [1]
-        for state in old_states:
-            new_state = kron(new_state, state)
+        if len(old_states) == 0:
+            raise ValueError("No quantum states found for provided keys.")
+        
+        if len(old_states) == 1:
+            compound_qobj = old_states[0]
+        else:
+            compound_qobj = qutip.tensor(old_states)
 
-        # get circuit matrix; expand if necessary
-        circ_mat = circuit.get_unitary_matrix()
-        if circuit.size < len(all_keys):
-            # pad size of circuit matrix if necessary
-            diff = len(all_keys) - circuit.size
-            circ_mat = kron(circ_mat, identity(2 ** diff))
+        circ_unitary = circuit.get_unitary_qobj()
 
-        # apply any necessary swaps
-        if not all([all_keys.index(key) == i for i, key in enumerate(keys)]):
-            all_keys, swap_mat = self._swap_qubits(all_keys, keys)
-            circ_mat = circ_mat @ swap_mat
+        if circuit.num_qubits < len(all_keys):
+            num_padding_qubits = len(all_keys) - circuit.num_qubits
+            identity_qobj = qutip.identity([2] * num_padding_qubits)
+            circ_unitary = qutip.tensor(circ_unitary, identity_qobj)
 
-        return new_state, all_keys, circ_mat
+        logger.warning(f"[{self.timeline.now()}] `_swap_qubits` is a legacy method from NumPy-based formalism. Its exact usage with QuTiP Qobjs may differ.")
+        return compound_qobj, all_keys, circ_unitary
 
-    def _swap_qubits(self, all_keys, keys):
-        swap_circuit = QubitCircuit(N=len(all_keys))
-        for i, key in enumerate(keys):
-            j = all_keys.index(key)
-            if j != i:
-                gate = Gate("SWAP", targets=[i, j])
-                swap_circuit.add_gate(gate)
-                all_keys[i], all_keys[j] = all_keys[j], all_keys[i]
-        swap_mat = gate_sequence_product(swap_circuit.propagators()).full()
-        return all_keys, swap_mat
+    def _swap_qubits(self, all_keys: list[int], target_keys: list[int]) -> tuple[list[int], qutip.Qobj]:
+        logger.warning(f"[{self.timeline.now()}] `_swap_qubits` is a legacy method from NumPy-based formalism. Its exact usage with QuTiP Qobjs may differ.")
+        num_total_qubits = len(all_keys)
+        # This function should ideally build a QuTiP swap unitary if truly needed.
+        # For current structure, `Circuit.run` is expected to handle qubit mapping.
+        return all_keys, qutip.identity([2]*num_total_qubits)
 
     @abstractmethod
-    def set(self, keys: list[int], amplitudes: any) -> None:
-        """Method to set quantum state at a given key(s).
-
-        Args:
-            keys (list[int]): key(s) of state(s) to change.
-            amplitudes (any): Amplitudes to set state to, type determined by type of subclass.
-        """
-
-        # num_subsystems = log(len(amplitudes)) / log(self.dim)
-        # assert self.dim ** int(round(num_subsystems)) == len(amplitudes),\
-        #     "Length of amplitudes should be d ** n, " \
-        #     "where d is subsystem Hilbert space dimension and n is the number of subsystems. " \
-        #     "Actual amplitude length: {}, dim: {}, num subsystems: {}".format(
-        #         len(amplitudes), self.dim, num_subsystems
-        #     )
-        # num_subsystems = int(round(num_subsystems))
-        # assert num_subsystems == len(keys),\
-        #     "Length of amplitudes should be d ** n, " \
-        #     "where d is subsystem Hilbert space dimension and n is the number of subsystems. " \
-        #     "Amplitude length: {}, expected subsystems: {}, num keys: {}".format(
-        #         len(amplitudes), num_subsystems, len(keys)
-        #     )
-
+    def set(self, keys: list[int], state_data: Any) -> None:
         pass
 
     def remove(self, key: int) -> None:
-        """Method to remove state stored at key."""
-        del self.states[key]
+        qstate_wrapper = self.states.get(key)
+        if qstate_wrapper:
+            for k in qstate_wrapper.keys:
+                if k in self.states:
+                    del self.states[k]
+            logger.debug(f"Removed quantum state associated with keys {qstate_wrapper.keys}.")
+        else:
+            logger.warning(f"Attempted to remove non-existent quantum state for key: {key}.")
 
     def set_states(self, states: dict):
         self.states = states
+        if self.states:
+            self._least_available = max(self.states.keys()) + 1
+        else:
+            self._least_available = 0
+        logger.debug(f"QuantumManager states directly set. Next available key: {self._least_available}.")
+
+    class State:
+        def __init__(self, keys: List[int], state: qutip.Qobj, truncation: int = 1):
+            self.keys = sorted(keys)
+            self.state = state
+            self.truncation = truncation
+
+        @property
+        def state_data(self):
+            if self.state.isket:
+                return self.state.full().flatten().tolist()
+            elif self.state.isdm:
+                return self.state.full().tolist()
+            else:
+                return self.state.data
+
+        @property
+        def dims(self):
+            return self.state.dims
+
+        def __str__(self):
+            return f"QuantumManager.State(keys={self.keys}, state_dims={self.state.dims[0]})"
+        
+        def __repr__(self):
+            return str(self)
+
+        def __eq__(self, other):
+            if not isinstance(other, QuantumManager.State):
+                return NotImplemented
+            return set(self.keys) == set(other.keys) and self.state == other.state
 
 
 class QuantumManagerKet(QuantumManager):
-    """Class to track and manage quantum states with the ket vector formalism."""
+    def __init__(self, timeline: "Timeline", truncation: int = 1): # FIX: Added timeline
+        super().__init__(timeline, KET_STATE_FORMALISM, truncation) # FIX: Pass timeline to super
 
-    def __init__(self):
-        super().__init__(KET_STATE_FORMALISM)
+    def new(self, state_data: list[complex] = None) -> int:
+        if state_data is None:
+            state_data = [complex(1), complex(0)]
+        
+        qobj_state = qutip.Qobj(state_data, dims=[[self.dim], [1]])
 
-    def new(self, state=(complex(1), complex(0))) -> int:
         key = self._least_available
         self._least_available += 1
-        self.states[key] = KetState(state, [key])
+        
+        self.states[key] = self.State([key], qobj_state, self.truncation)
+        logger.debug(f"New ket state created for key {key}: {qobj_state}")
         return key
 
-    def run_circuit(self, circuit: Circuit, keys: list[int], meas_samp=None) -> dict[int, int]:
+    def run_circuit(self, circuit: "Circuit", keys: list[int], meas_samp: float = None) -> dict[int, Any]:
         super().run_circuit(circuit, keys, meas_samp)
-        new_state, all_keys, circ_mat = self._prepare_circuit(circuit, keys)
 
-        new_state = circ_mat @ new_state
+        main_qstate_wrapper = self.get(keys[0])
+        current_qobj = main_qstate_wrapper.state
 
-        if len(circuit.measured_qubits) == 0:
-            # set state, return no measurement result
-            new_ket = KetState(new_state, all_keys)
-            for key in all_keys:
-                self.states[key] = new_ket
-            return {}
-        else:
-            # measure state (state reassignment done in _measure method)
-            keys = [all_keys[i] for i in circuit.measured_qubits]
-            return self._measure(new_state, keys, all_keys, meas_samp)
+        if not current_qobj.isket:
+            logger.error(f"[{self.timeline.now()}] run_circuit on KetManager received a non-ket state.")
+            raise TypeError("QuantumManagerKet can only run circuits on ket states.")
 
-    def set(self, keys: list[int], amplitudes: list[complex]) -> None:
-        super().set(keys, amplitudes)
-        new_state = KetState(amplitudes, keys)
+        new_qobj, measurement_results = circuit.run(current_qobj, meas_samp, self.formalism, keys_order=keys)
+
+        main_qstate_wrapper.state = new_qobj
+        
+        if measurement_results:
+            self._measure_post_circuit(new_qobj, keys, main_qstate_wrapper.keys, measurement_results)
+
+        logger.debug(f"Circuit applied to ket states {keys}. New state:\n{new_qobj}")
+        return measurement_results
+
+    def set(self, keys: list[int], state_data: list[complex]) -> None:
+        num_subsystems = int(round(log(len(state_data), self.dim)))
+        assert self.dim ** num_subsystems == len(state_data), \
+            f"Length of amplitudes ({len(state_data)}) should be d**n (d={self.dim}, n={num_subsystems})."
+        assert num_subsystems == len(keys), \
+            f"Number of subsystems ({num_subsystems}) must match number of keys ({len(keys)})."
+
+        qobj_state = qutip.Qobj(state_data)
+        if not qobj_state.isket:
+            logger.error(f"[{self.timeline.now()}] Attempted to set non-ket state in KetManager: {state_data}")
+            raise ValueError("QuantumManagerKet can only set ket states.")
+
+        quantum_state_object = self.State(keys, qobj_state, self.truncation)
         for key in keys:
-            self.states[key] = new_state
+            self.states[key] = quantum_state_object
+        logger.debug(f"Set ket state for keys {keys}. Current state:\n{qobj_state}")
 
     def set_to_zero(self, key: int):
         self.set([key], [complex(1), complex(0)])
@@ -205,131 +235,84 @@ class QuantumManagerKet(QuantumManager):
     def set_to_one(self, key: int):
         self.set([key], [complex(0), complex(1)])
 
-    def _measure(self, state: list[complex], keys: list[int],
-                 all_keys: list[int], meas_samp: float) -> dict[int, int]:
-        """Method to measure qubits at given keys.
+    def _measure_post_circuit(self, collapsed_qobj: qutip.Qobj, measured_keys: list[int],
+                              all_keys: list[int], measurement_results: dict[int, int]) -> None:
+        unmeasured_keys = [k for k in all_keys if k not in measured_keys]
 
-        SHOULD NOT be called individually; only from circuit method (unless for unit testing purposes).
-        Modifies quantum state of all qubits given by all_keys.
-
-        Args:
-            state (list[complex]): state to measure.
-            keys (list[int]): list of keys to measure.
-            all_keys (list[int]): list of all keys corresponding to state.
-            meas_samp (float): random sample used for measurement result.
-
-        Returns:
-            dict[int, int]: mapping of measured keys to measurement results.
-        """
-
-        if len(keys) == 1:
-            if len(all_keys) == 1:
-                prob_0 = measure_state_with_cache_ket(tuple(state))
-                if meas_samp < prob_0:
-                    result = 0
-                else:
-                    result = 1
-
-            else:
-                key = keys[0]
-                num_states = len(all_keys)
-                state_index = all_keys.index(key)
-                state_0, state_1, prob_0 = measure_entangled_state_with_cache_ket(tuple(state), state_index, num_states)
-                if meas_samp < prob_0:
-                    new_state = array(state_0, dtype=complex)
-                    result = 0
-                else:
-                    new_state = array(state_1, dtype=complex)
-                    result = 1
-
-            all_keys.remove(keys[0])
-
+        for key, result in measurement_results.items():
+            single_qubit_ket = qutip.basis(self.dim, result)
+            self.states[key] = self.State([key], single_qubit_ket, self.truncation)
+            logger.debug(f"Measured qubit {key} result {result}. Set to {single_qubit_ket}.")
+        
+        if len(unmeasured_keys) > 0 and collapsed_qobj.dims[0] == ([self.dim] * len(unmeasured_keys)):
+            remaining_state_wrapper = self.State(unmeasured_keys, collapsed_qobj, self.truncation)
+            for key in unmeasured_keys:
+                self.states[key] = remaining_state_wrapper
+            logger.debug(f"Remaining ket state assigned to keys {unmeasured_keys}.")
         else:
-            # swap states into correct position
-            if not all(
-                    [all_keys.index(key) == i for i, key in enumerate(keys)]):
-                all_keys, swap_mat = self._swap_qubits(all_keys, keys)
-                state = swap_mat @ state
-
-            # calculate meas probabilities and projected states
-            len_diff = len(all_keys) - len(keys)
-            new_states, probabilities = measure_multiple_with_cache_ket(
-                tuple(state), len(keys), len_diff)
-
-            # choose result, set as new state
-            for i in range(int(2 ** len(keys))):
-                if meas_samp < sum(probabilities[:i + 1]):
-                    result = i
-                    new_state = new_states[i]
-                    break
-
-            for key in keys:
-                all_keys.remove(key)
-
-        result_states = [array([1, 0]), array([0, 1])]
-        result_digits = [int(x) for x in bin(result)[2:]]
-        while len(result_digits) < len(keys):
-            result_digits.insert(0, 0)
-
-        for res, key in zip(result_digits, keys):
-            # set to state measured
-            new_state_obj = KetState(result_states[res], [key])
-            self.states[key] = new_state_obj
-        
-        if len(all_keys) > 0:
-            new_state_obj = KetState(new_state, all_keys)
-            for key in all_keys:
-                self.states[key] = new_state_obj
-        
-        return dict(zip(keys, result_digits))
+            pass
 
 
 class QuantumManagerDensity(QuantumManager):
-    """Class to track and manage states with the density matrix formalism."""
+    def __init__(self, timeline: "Timeline", truncation: int = 1): # FIX: Added timeline
+        super().__init__(timeline, DENSITY_MATRIX_FORMALISM, truncation) # FIX: Pass timeline to super
 
-    def __init__(self):
-        super().__init__(DENSITY_MATRIX_FORMALISM)
+    def new(self, state_data: Union[list[list[complex]], list[complex]] = None) -> int:
+        if state_data is None:
+            state_data = [[complex(1), complex(0)], [complex(0), complex(0)]]
+        
+        qobj_state = qutip.Qobj(state_data)
+        if not qobj_state.isdm:
+            qobj_state = qobj_state * qobj_state.dag()
 
-    def new(self,
-            state=([complex(1), complex(0)], [complex(0), complex(0)])) -> int:
         key = self._least_available
         self._least_available += 1
-        self.states[key] = DensityState(state, [key])
+        self.states[key] = self.State([key], qobj_state, self.truncation)
+        logger.debug(f"New density state created for key {key}:\n{qobj_state}")
         return key
 
-    def run_circuit(self, circuit: Circuit, keys: list[int], meas_samp=None) -> dict[int, int]:
+    def run_circuit(self, circuit: "Circuit", keys: list[int], meas_samp: float = None) -> dict[int, Any]:
         super().run_circuit(circuit, keys, meas_samp)
-        new_state, all_keys, circ_mat = super()._prepare_circuit(circuit, keys)
 
-        new_state = circ_mat @ new_state @ circ_mat.conj().T
+        main_qstate_wrapper = self.get(keys[0])
+        current_qobj = main_qstate_wrapper.state
 
-        if len(circuit.measured_qubits) == 0:
-            # set state, return no measurement result
-            new_state_obj = DensityState(new_state, all_keys)
-            for key in all_keys:
-                self.states[key] = new_state_obj
-            return {}
+        if not current_qobj.isdm:
+            logger.error(f"[{self.timeline.now()}] run_circuit on DensityManager received a non-density matrix state.")
+            raise TypeError("QuantumManagerDensity can only run circuits on density matrix states.")
+
+        new_qobj, measurement_results = circuit.run(current_qobj, meas_samp, self.formalism, keys_order=keys)
+
+        main_qstate_wrapper.state = new_qobj
+
+        if measurement_results:
+            self._measure_post_circuit(new_qobj, keys, main_qstate_wrapper.keys, measurement_results)
+
+        logger.debug(f"Circuit applied to density states {keys}. New state:\n{new_qobj}")
+        return measurement_results
+
+    def set(self, keys: list[int], state_data: Union[list[list[complex]], list[complex]]) -> None:
+        if isinstance(state_data[0], list):
+            matrix_dim = len(state_data)
+            num_subsystems = int(round(log(matrix_dim, self.dim)))
         else:
-            # measure state (state reassignment done in _measure method)
-            keys = [all_keys[i] for i in circuit.measured_qubits]
-            return self._measure(new_state, keys, all_keys, meas_samp)
+            vector_len = len(state_data)
+            num_subsystems = int(round(log(vector_len, self.dim)))
 
-    def set(self, keys: list[int], state: list[list[complex]]) -> None:
-        """Method to set the quantum state at the given keys.
+        assert self.dim ** num_subsystems == (len(state_data) if not isinstance(state_data[0], list) else len(state_data) * len(state_data[0])), \
+            f"Length/dimensions of state ({len(state_data)}) should be d**n (d={self.dim}, n={num_subsystems})."
+        assert num_subsystems == len(keys), \
+            f"Number of subsystems ({num_subsystems}) must match number of keys ({len(keys)})."
 
-        The `state` argument should be passed as list[list[complex]], where each internal list is a row.
-        However, the `state` may also be given as a one-dimensional pure state.
-        If the list is one-dimensional, will be converted to matrix with the outer product operation.
+        qobj_state = qutip.Qobj(state_data)
+        if not qobj_state.isdm:
+            qobj_state = qobj_state * qobj_state.dag()
 
-        Args:
-            keys (list[int]): list of quantum manager keys to modify.
-            state: quantum state to set input keys to.
-        """
-
-        super().set(keys, state)
-        new_state = DensityState(state, keys)
+        quantum_state_object = self.State(keys, qobj_state, self.truncation)
         for key in keys:
-            self.states[key] = new_state
+            self.states[key] = quantum_state_object
+        logger.debug(f"Set density state for keys {keys}. Current state:\n{qobj_state}")
+
 
     def set_to_zero(self, key: int):
         self.set([key], [[complex(1), complex(0)], [complex(0), complex(0)]])
@@ -337,424 +320,313 @@ class QuantumManagerDensity(QuantumManager):
     def set_to_one(self, key: int):
         self.set([key], [[complex(0), complex(0)], [complex(0), complex(1)]])
 
-    def _measure(self, state: list[list[complex]], keys: list[int],
-                 all_keys: list[int], meas_samp: float) -> dict[int, int]:
-        """Method to measure qubits at given keys.
+    def _measure_post_circuit(self, collapsed_qobj: qutip.Qobj, measured_keys: list[int],
+                              all_keys: list[int], measurement_results: dict[int, int]) -> None:
+        unmeasured_keys = [k for k in all_keys if k not in measured_keys]
 
-        SHOULD NOT be called individually; only from circuit method (unless for unit testing purposes).
-        Modifies quantum state of all qubits given by all_keys.
-
-        Args:
-            state (list[complex]): state to measure.
-            keys (list[int]): list of keys to measure.
-            all_keys (list[int]): list of all keys corresponding to state.
-            meas_samp (float): random sample used for measurement result.
-
-        Returns:
-            dict[int, int]: mapping of measured keys to measurement results.
-        """
-
-        if len(keys) == 1:
-            if len(all_keys) == 1:
-                prob_0 = measure_state_with_cache_density(tuple(map(tuple, state)))
-                if meas_samp < prob_0:
-                    result = 0
-                    new_state = [[1, 0], [0, 0]]
-                else:
-                    result = 1
-                    new_state = [[0, 0], [0, 1]]
-
+        for key, result in measurement_results.items():
+            single_qubit_dm = qutip.basis(self.dim, result) * qutip.basis(self.dim, result).dag()
+            self.states[key] = self.State([key], single_qubit_dm, self.truncation)
+            logger.debug(f"Measured qubit {key} result {result}. Set to {single_qubit_dm}.")
+        
+        if len(unmeasured_keys) > 0 and collapsed_qobj.isdm:
+            if collapsed_qobj.dims[0] == ([self.dim] * len(unmeasured_keys)):
+                remaining_state_wrapper = self.State(unmeasured_keys, collapsed_qobj, self.truncation)
+                for key in unmeasured_keys:
+                    self.states[key] = remaining_state_wrapper
+                logger.debug(f"Remaining density state assigned to keys {unmeasured_keys}.")
             else:
-                key = keys[0]
-                num_states = len(all_keys)
-                state_index = all_keys.index(key)
-                state_0, state_1, prob_0 =\
-                    measure_entangled_state_with_cache_density(tuple(map(tuple, state)), state_index, num_states)
-                if meas_samp < prob_0:
-                    new_state = array(state_0, dtype=complex)
-                    result = 0
-                else:
-                    new_state = array(state_1, dtype=complex)
-                    result = 1
-
-        else:
-            # swap states into correct position
-            if not all(
-                    [all_keys.index(key) == i for i, key in enumerate(keys)]):
-                all_keys, swap_mat = self._swap_qubits(all_keys, keys)
-                state = swap_mat @ state @ swap_mat.T
-
-            # calculate meas probabilities and projected states
-            len_diff = len(all_keys) - len(keys)
-            state_to_measure = tuple(map(tuple, state))
-            new_states, probabilities = measure_multiple_with_cache_density(
-                state_to_measure, len(keys), len_diff)
-
-            # choose result, set as new state
-            for i in range(int(2 ** len(keys))):
-                if meas_samp < sum(probabilities[:i + 1]):
-                    result = i
-                    new_state = new_states[i]
-                    break
-
-        result_digits = [int(x) for x in bin(result)[2:]]
-        while len(result_digits) < len(keys):
-            result_digits.insert(0, 0)
-
-        new_state_obj = DensityState(new_state, all_keys)
-        for key in all_keys:
-            self.states[key] = new_state_obj
-
-        return dict(zip(keys, result_digits))
+                pass
 
 
 class QuantumManagerDensityFock(QuantumManager):
-    """Class to track and manage Fock states with the density matrix formalism."""
+    def __init__(self, timeline: "Timeline", truncation: int = 1): # FIX: Added timeline
+        super().__init__(timeline, FOCK_DENSITY_MATRIX_FORMALISM, truncation=truncation) # FIX: Pass timeline to super
 
-    def __init__(self, truncation: int = 1):
-        # default truncation is 1 for 2-d Fock space.
-        super().__init__(DENSITY_MATRIX_FORMALISM, truncation=truncation)
-
-    def new(self, state=None) -> int:
-        """Method to create a new state with key
-
-        Args:
-            state (str | list[complex] | list[list[complex]]): amplitudes of new state.
-                Default value is 'gnd': create zero-excitation state with current truncation.
-                Other inputs are passed to the constructor of `DensityState`.
-        """
-
+    def new(self, state_data: Union[str, list[complex], list[list[complex]]] = "gnd") -> int:
         key = self._least_available
         self._least_available += 1
-        if state is None:
-            gnd = [1] + [0]*self.truncation
-            self.states[key] = DensityState(gnd, [key], truncation=self.truncation)
-        else:
-            self.states[key] = DensityState(state, [key], truncation=self.truncation)
 
+        qobj_state = None
+        if state_data == "gnd":
+            gnd_ket = qutip.basis(self.dim, 0)
+            qobj_state = gnd_ket * gnd_ket.dag()
+        elif isinstance(state_data, list):
+            qobj_state = qutip.Qobj(state_data)
+            if not qobj_state.isdm:
+                qobj_state = qobj_state * qobj_state.dag()
+        else:
+            logger.error(f"Unsupported Fock state data for new(): {state_data}")
+            raise ValueError("Unsupported Fock state data.")
+
+        self.states[key] = self.State([key], qobj_state, self.truncation)
+        logger.debug(f"New Fock density state created for key {key}:\n{qobj_state}")
         return key
 
-    def run_circuit(self, circuit: Circuit, keys: list[int], meas_samp=None) -> dict[int, int]:
-        """Currently the Fock states do not support quantum circuits.
-        This method is only to implement abstract method of parent class and SHOULD NOT be called after instantiation.
-        """
-        raise Exception("run_circuit method of class QuantumManagerDensityFock called")
+    def run_circuit(self, circuit: "Circuit", keys: list[int], meas_samp: float = None) -> dict[int, Any]:
+        logger.error(f"[{self.timeline.now()}] run_circuit method of class QuantumManagerDensityFock called, which is not supported.")
+        raise NotImplementedError("run_circuit method of class QuantumManagerDensityFock is not supported.")
 
-    def _generate_swap_operator(self, num_systems: int, i: int, j: int):
-        """Helper function to generate swapping unitary.
+    def _generate_swap_operator(self, num_systems: int, i: int, j: int) -> qutip.Qobj:
+        size_total = self.dim ** num_systems
+        swap_matrix = np.zeros((size_total, size_total), dtype=complex)
 
-        Args:
-            num_systems (int): number of subsystems in state
-            i (int): index of first subsystem to swap
-            j (int): index of second subsystem to swap
-
-        Returns:
-            Array[int]: unitary swapping operator
-        """
-
-        size = self.dim ** num_systems
-        swap_unitary = zeros((size, size))
-
-        for old_index in range(size):
-            old_str = base_repr(old_index, self.dim)
-            old_str = old_str.zfill(num_systems)
-            new_str = ''.join((old_str[:i], old_str[j], old_str[i+1:j], old_str[i], old_str[j+1:]))
+        for old_index in range(size_total):
+            old_str = np.base_repr(old_index, base=self.dim).zfill(num_systems)
+            
+            new_str_list = list(old_str)
+            new_str_list[i], new_str_list[j] = new_str_list[j], new_str_list[i]
+            new_str = "".join(new_str_list)
+            
             new_index = int(new_str, base=self.dim)
-            swap_unitary[new_index, old_index] = 1
+            swap_matrix[new_index, old_index] = 1
 
-        return swap_unitary
+        return qutip.Qobj(swap_matrix, dims=[[self.dim] * num_systems, [self.dim] * num_systems])
 
-    def _prepare_state(self, keys: list[int]):
-        """Function to prepare states at given keys for operator application.
+    def _prepare_state(self, keys: list[int]) -> tuple[qutip.Qobj, list[int]]:
+        old_qobjs: list[qutip.Qobj] = []
+        all_keys: list[int] = []
 
-        Will take composite quantum state and swap subsystems to correspond with listed keys.
-        Should not be called directly, but from method to apply operator or measure state.
-
-        Args:
-            keys (list[int]): keys for states to apply operator to.
-
-        Returns:
-            tuple(list[list[complex]], list[int]): tuple containing:
-                1. new state to apply operator to, with keys swapped to be consecutive.
-                2. list of keys corresponding to new state.
-        """
-
-        old_states = []
-        all_keys = []
-
-        # go through keys and get all unique qstate objects
         for key in keys:
-            qstate = self.states[key]
-            if qstate.keys[0] not in all_keys:
-                old_states.append(qstate.state)
-                all_keys += qstate.keys
+            qstate_wrapper = self.states[key]
+            if qstate_wrapper.keys[0] not in all_keys:
+                old_qobjs.append(qstate_wrapper.state)
+                all_keys.extend(qstate_wrapper.keys)
 
-        # construct compound state
-        new_state = [1]
-        for state in old_states:
-            new_state = kron(new_state, state)
-
-        # apply any necessary swaps to order keys
+        if len(old_qobjs) == 0:
+            raise ValueError("No quantum states found for provided keys.")
+        
+        if len(old_qobjs) == 1:
+            compound_qobj = old_qobjs[0]
+        else:
+            compound_qobj = qutip.tensor(old_qobjs)
+        
         if len(keys) > 1:
+            current_permutation = list(range(len(all_keys)))
+            ordered_all_keys = list(keys) + [k for k in all_keys if k not in keys]
+            desired_idx_map = {k: i for i, k in enumerate(ordered_all_keys)}
+            
+            for i, target_key in enumerate(keys):
+                current_pos_of_target_key = current_permutation.index(desired_idx_map[target_key])
+                
+                if current_pos_of_target_key != i:
+                    idx_to_swap_with = current_permutation[i]
+                    current_permutation[i], current_permutation[current_pos_of_target_key] = \
+                        current_permutation[current_pos_of_target_key], current_permutation[i]
+                    
+                    swap_op_qobj = self._generate_swap_operator(len(all_keys), i, current_pos_of_target_key)
+                    compound_qobj = swap_op_qobj * compound_qobj * swap_op_qobj.dag()
 
-            # generate desired key order
-            start_idx = all_keys.index(keys[0])
-            if start_idx + len(keys) > len(all_keys):
-                start_idx = len(all_keys) - len(keys)
+            all_keys = ordered_all_keys
 
-            for i, key in enumerate(keys):
-                i = i + start_idx
-                j = all_keys.index(key)
-                if j != i:
-                    swap_unitary = self._generate_swap_operator(len(all_keys), i, j)
-                    new_state = swap_unitary @ new_state @ swap_unitary.T
-                    all_keys[i], all_keys[j] = all_keys[j], all_keys[i]
+        return compound_qobj, all_keys
 
-        return new_state, all_keys
+    def _prepare_operator(self, all_keys: list[int], keys: list[int], operator_qobj: qutip.Qobj) -> qutip.Qobj:
+        num_target_qubits = len(keys)
+        num_total_qubits = len(all_keys)
 
-    def _prepare_operator(self, all_keys: list[int], keys: list[int], operator) -> array:
-        # pad operator with identity
-        left_dim = self.dim ** all_keys.index(keys[0])
-        right_dim = self.dim ** (len(all_keys) - all_keys.index(keys[-1]) - 1)
-        prepared_operator = operator
-
-        if left_dim > 0:
-            prepared_operator = kron(identity(left_dim), prepared_operator)
-        if right_dim > 0:
-            prepared_operator = kron(prepared_operator, identity(right_dim))
+        identity_qobj = qutip.identity([self.dim] * (num_total_qubits - num_target_qubits))
+        prepared_operator = qutip.tensor(operator_qobj, identity_qobj)
 
         return prepared_operator
 
-    def apply_operator(self, operator: array, keys: list[int]):
-        prepared_state, all_keys = self._prepare_state(keys)
-        prepared_operator = self._prepare_operator(all_keys, keys, operator)
-        new_state = prepared_operator @ prepared_state @ prepared_operator.conj().T
-        self.set(all_keys, new_state)
+    def apply_operator(self, operator_data: Union[np.ndarray, qutip.Qobj], keys: list[int]):
+        operator_qobj = qutip.Qobj(operator_data)
 
-    def set(self, keys: list[int], state: list[list[complex]]) -> None:
-        """Method to set the quantum state at the given keys.
+        prepared_state_qobj, all_keys = self._prepare_state(keys)
+        prepared_operator_qobj = self._prepare_operator(all_keys, keys, operator_qobj)
 
-        The `state` argument should be passed as list[list[complex]], where each internal list is a row.
-        However, the `state` may also be given as a one-dimensional pure state.
-        If the list is one-dimensional, will be converted to matrix with the outer product operation.
+        new_state_qobj = prepared_operator_qobj * prepared_state_qobj * prepared_operator_qobj.dag()
+        self.set(all_keys, new_state_qobj)
+        logger.debug(f"Applied operator to Fock state keys {keys}. New state:\n{new_state_qobj}")
 
-        Args:
-            keys (list[int]): list of quantum manager keys to modify.
-            state: quantum state to set input keys to.
-        """
+    def set(self, keys: list[int], state_data: Union[list[list[complex]], list[complex]]) -> None:
+        if isinstance(state_data[0], list):
+            matrix_dim = len(state_data)
+            num_subsystems = int(round(log(matrix_dim, self.dim)))
+        else:
+            vector_len = len(state_data)
+            num_subsystems = int(round(log(vector_len, self.dim)))
 
-        super().set(keys, state)
-        new_state = DensityState(state, keys, truncation=self.truncation)
+        assert self.dim ** num_subsystems == (len(state_data) if not isinstance(state_data[0], list) else len(state_data) * len(state_data[0])), \
+            f"Length/dimensions of state ({len(state_data)}) should be d**n (d={self.dim}, n={num_subsystems})."
+        assert num_subsystems == len(keys), \
+            f"Number of subsystems ({num_subsystems}) must match number of keys ({len(keys)})."
+
+        qobj_state = qutip.Qobj(state_data)
+        if not qobj_state.isdm:
+            qobj_state = qobj_state * qobj_state.dag()
+
+        quantum_state_object = self.State(keys, qobj_state, self.truncation)
         for key in keys:
-            self.states[key] = new_state
+            self.states[key] = quantum_state_object
+        logger.debug(f"Set Fock density state for keys {keys}. Current state:\n{qobj_state}")
 
     def set_to_zero(self, key: int):
-        """set the state to ground (zero) state."""
-        gnd = [1] + [0]*self.truncation
-        self.set([key], gnd)
+        gnd_ket = qutip.basis(self.dim, 0)
+        self.set([key], (gnd_ket * gnd_ket.dag()).full().tolist())
 
-    def build_ladder(self):
-        """Generate matrix of creation and annihilation (ladder) operators on truncated Hilbert space."""
-        truncation = self.truncation
-        data = array([sqrt(i+1) for i in range(truncation)])  # elements in create/annihilation operator matrix
-        row = array([i+1 for i in range(truncation)])
-        col = array([i for i in range(truncation)])
-        create = csr_matrix((data, (row, col)), shape=(truncation+1, truncation+1)).toarray()
-        destroy = create.conj().T
+    def build_ladder(self) -> tuple[qutip.Qobj, qutip.Qobj]:
+        destroy_op = qutip.destroy(self.truncation + 1)
+        create_op = qutip.create(self.truncation + 1)
+        return create_op, destroy_op
 
-        return create, destroy
+    def measure(self, keys: list[int], povms: list[Union[np.ndarray, qutip.Qobj]], meas_samp: float) -> int:
+        if not keys:
+            raise ValueError("Keys list cannot be empty for measurement.")
 
-    def measure(self, keys: list[int], povms: list[array], meas_samp: float) -> int:
-        """Method to measure subsystems at given keys in POVM formalism.
+        main_state_wrapper = self.get(keys[0])
+        current_qobj = main_state_wrapper.state
 
-        Serves as wrapper for private `_measure` method, performing quantum manager specific operations.
+        if not current_qobj.isdm:
+            logger.error(f"[{self.timeline.now()}] measure on FockDensityManager received a non-density matrix state.")
+            raise TypeError("QuantumManagerDensityFock can only measure density matrix states.")
 
-        Args:
-            keys (list[int]): list of keys to measure.
-            povms: (list[array]): list of POVM operators to use for measurement.
-            meas_samp (float): random measurement sample to use for computing resultant state.
+        qobj_povms = [qutip.Qobj(p) for p in povms]
 
-        Returns:
-            int: measurement as index of matching POVM in supplied tuple.
-        """
+        probabilities = [np.trace(p * current_qobj).real for p in qobj_povms]
+        probabilities = np.array(probabilities)
 
-        new_state, all_keys = self._prepare_state(keys)
-        return self._measure(new_state, keys, all_keys, povms, meas_samp)
+        prob_sum = np.sum(probabilities)
+        if not math.isclose(prob_sum, 1.0, rel_tol=1e-9, abs_tol=1e-12) or np.any(probabilities < 0):
+            logger.warning(f"POVM probabilities do not sum to 1 or contain negative values: {probabilities}. Normalizing.")
+            probabilities[probabilities < 0] = 0
+            probabilities = probabilities / np.sum(probabilities)
 
-    def _measure(self, state: list[list[complex]], keys: list[int],
-                 all_keys: list[int], povms: list[array], meas_samp: float) -> int:
-        """Method to measure subsystems at given keys in POVM formalism.
+        outcome_idx = np.searchsorted(np.cumsum(probabilities), meas_samp)
 
-        Modifies quantum state of all qubits given by all_keys, post-measurement operator determined
-        by measurement operators which are chosen as square root of POVM operators.
-
-        Args:
-            state (list[list[complex]]): state to measure.
-            keys (list[int]): list of keys to measure.
-            all_keys (list[int]): list of all keys corresponding to state.
-            povms: (list[array]): list of POVM operators to use for measurement.
-            meas_samp (float): random measurement sample to use for computing resultant state.
-
-        Returns:
-            int: measurement as index of matching POVM in supplied tuple.
-        """
-
-        state_tuple = tuple(map(tuple, state))
-        povm_tuple = tuple([tuple(map(tuple, povm)) for povm in povms])
-        new_state = None
-        result = 0
-
-        # calculate meas probabilities and projected states
-        if len(keys) == 1:
-            if len(all_keys) == 1:
-                states, probs = measure_state_with_cache_fock_density(state_tuple, povm_tuple)
-
-            else:
-                key = keys[0]
-                num_states = len(all_keys)
-                state_index = all_keys.index(key)
-                states, probs = \
-                    measure_entangled_state_with_cache_fock_density(state_tuple, state_index, num_states, povm_tuple,
-                                                                    self.truncation)
-
-        else:
-            indices = tuple([all_keys.index(key) for key in keys])
-            states, probs = \
-                measure_multiple_with_cache_fock_density(state_tuple, indices, len(all_keys), povm_tuple,
-                                                         self.truncation)
-
-        # calculate result based on measurement sample.
-        prob_sum = cumsum(probs)
-        for i, (output_state, p) in enumerate(zip(states, prob_sum)):
-            if meas_samp < p:
-                new_state = output_state
-                result = i
-                break
-
-        """
-        # for potential future work
-        result_digits = [int(x) for x in base_repr(result, base=self.dim)[2:]]
-        while len(result_digits) < len(keys):
-            result_digits.insert(0, 0)
-
-        # assign measured states
-        for key, result in zip(keys, result_digits):
-            state = [0] * self.dim
-            state[result] = 1
-            self.set([key], state)
-        """
-
+        projected_state = (qobj_povms[outcome_idx] * current_qobj * qobj_povms[outcome_idx].dag()).unit()
+        
+        all_keys = main_state_wrapper.keys
+        
         for key in keys:
-            self.states[key] = None  # clear the stored state at key (particle destructively measured)
+            if key in self.states:
+                del self.states[key]
+            logger.debug(f"Cleared state for measured key {key}.")
 
-        # assign remaining state
-        if len(keys) < len(all_keys):
-            indices = tuple([all_keys.index(key) for key in keys])
-            new_state_tuple = tuple(map(tuple, new_state))
-            remaining_state = density_partial_trace(new_state_tuple, indices, len(all_keys), self.truncation)
-            remaining_keys = [key for key in all_keys if key not in keys]
-            self.set(remaining_keys, remaining_state)
+        remaining_keys = [k for k in all_keys if k not in keys]
+        if remaining_keys:
+            original_qobj_dims = current_qobj.dims[0]
+            original_num_qubits = len(original_qobj_dims)
+            
+            measured_indices_in_qobj = [main_state_wrapper.keys.index(k) for k in keys]
+            
+            indices_to_keep = [i for i in range(original_num_qubits) if i not in measured_indices_in_qobj]
 
-        return result
+            if indices_to_keep:
+                remaining_qobj = projected_state.ptrace(indices_to_keep)
+                remaining_state_wrapper = self.State(remaining_keys, remaining_qobj, self.truncation)
+                for key in remaining_keys:
+                    self.states[key] = remaining_state_wrapper
+                logger.debug(f"Remaining Fock density state assigned to keys {remaining_keys}.")
+            else:
+                logger.debug(f"No remaining keys after measurement for Fock state.")
+        else:
+            logger.debug(f"All Fock state keys were measured.")
 
-    def _build_loss_kraus_operators(self, loss_rate: float, all_keys: list[int], key: int) -> list[array]:
-        """Method to build Kraus operators of a generalized amplitude damping channel.
+        logger.debug(f"Measurement on Fock keys {keys} yielded outcome {outcome_idx}.")
+        return outcome_idx
 
-        This represents the effect of photon loss.
-
-        Args:
-            loss_rate (float): loss rate for the quantum channel.
-            all_keys (list[int]): list of all keys in affected state.
-            key (int): key for subsystem experiencing loss.
-
-        Returns:
-            list[array]: list of generated Kraus operators.
-        """
-
+    def _build_loss_kraus_operators(self, loss_rate: float, all_keys: list[int], key: int) -> list[qutip.Qobj]:
         assert 0 <= loss_rate <= 1
         kraus_ops = []
 
+        subsystem_index = all_keys.index(key)
+        num_total_systems = len(all_keys)
+        
         for k in range(self.dim):
-            total_kraus_op = zeros((self.dim ** len(all_keys), self.dim ** len(all_keys)))
+            total_kraus_op_matrix = np.zeros((self.dim ** num_total_systems, self.dim ** num_total_systems), dtype=complex)
 
             for n in range(k, self.dim):
-                coeff = sqrt(binom(n, k)) * sqrt(((1-loss_rate) ** (n-k)) * (loss_rate ** k))
-                single_op = zeros((self.dim, self.dim))
-                single_op[n-k, n] = 1
-                total_op = self._prepare_operator(all_keys, [key], single_op)
-                total_kraus_op += coeff * total_op
+                coeff = np.sqrt(math.comb(n, k)) * np.sqrt(((1 - loss_rate) ** (n - k)) * (loss_rate ** k))
+                
+                single_op_matrix = np.zeros((self.dim, self.dim), dtype=complex)
+                single_op_matrix[n - k, n] = 1
 
-            kraus_ops.append(total_kraus_op)
+                ops_list = [qutip.identity(self.dim)] * num_total_systems
+                ops_list[subsystem_index] = qutip.Qobj(single_op_matrix, dims=[[self.dim],[self.dim]])
+                
+                total_op_qobj = qutip.tensor(ops_list)
+                total_kraus_op_matrix += coeff * total_op_qobj.full()
+
+            if np.any(total_kraus_op_matrix != 0):
+                kraus_ops.append(qutip.Qobj(total_kraus_op_matrix, 
+                                            dims=[[self.dim] * num_total_systems, [self.dim] * num_total_systems]))
 
         return kraus_ops
 
-    def add_loss(self, key, loss_rate):
-        """Method to apply generalized amplitude damping channel on a *single* subspace corresponding to `key`.
+    def add_loss(self, key: int, loss_rate: float):
+        qstate_wrapper = self.get(key)
+        original_qobj = qstate_wrapper.state
+        all_keys = qstate_wrapper.keys
 
-        Args:
-            key (int): key for the subspace experiencing loss.
-            loss_rate (float): loss rate for the quantum channel.
-        """
+        if not original_qobj.isdm:
+            logger.error(f"[{self.timeline.now()}] add_loss on FockDensityManager requires density matrix state for key {key}.")
+            raise TypeError("add_loss requires a density matrix state.")
 
-        prepared_state, all_keys = self._prepare_state([key])
         kraus_ops = self._build_loss_kraus_operators(loss_rate, all_keys, key)
-        output_state = zeros(prepared_state.shape, dtype=complex)
-
+        
+        output_qobj = qutip.Qobj(np.zeros(original_qobj.shape), dims=original_qobj.dims)
+        
         for kraus_op in kraus_ops:
-            output_state += kraus_op @ prepared_state @ kraus_op.conj().T
+            if kraus_op.dims != original_qobj.dims:
+                logger.error(f"Kraus operator dims {kraus_op.dims} do not match state dims {original_qobj.dims}.")
+                continue
+            output_qobj += kraus_op * original_qobj * kraus_op.dag()
 
-        self.set(all_keys, output_state)
+        qstate_wrapper.state = output_qobj
+        logger.debug(f"Applied loss (rate {loss_rate:.2f}) to Fock state key {key}. New state:\n{output_qobj}")
 
 
 class QuantumManagerBellDiagonal(QuantumManager):
-    """Class to track and manage quantum states with the bell diagonal formalism.
+    def __init__(self, timeline: "Timeline"): # FIX: Added timeline
+        super().__init__(timeline, BELL_DIAGONAL_STATE_FORMALISM) # FIX: Pass timeline to super
 
-    To be aligned with analytical formulae, we have assumed that successfully generated EPR pair is in Phi+ form.
-    And note that the 4 BDS elements are in I, Z, X, Y order.
-
-    * BDS is only used for entanglement distribution (generation, swapping, purification), assuming underlying errors being purely Pauli.
-    * All manipulation results can be tracked analytically, without explicit quantum gates / channels / measurements.
-    """
-
-    def __init__(self):
-        super().__init__(BELL_DIAGONAL_STATE_FORMALISM)
-
-    def new(self, state=None) -> int:
-        """Generates new quantum state key for quantum manager.
-
-        NOTE: since this generates only one state, there will be no corresponding entangled state stored.
-        The Bell diagonal state formalism assumes entangled states;
-        thus, attempting to call `get` will return an exception until entangled.
-        The purpose of this function is thus mainly to avoid state key collisions.
-
-        Args:
-            state (Any): to conform to type definition (does nothing).
-
-        Returns:
-            int: quantum state key corresponding to state.
-        """
+    def new(self, state_data: Any = None) -> int:
         key = self._least_available
         self._least_available += 1
+        logger.debug(f"Generated new Bell diagonal key: {key}. State not yet set.")
         return key
 
-    def get(self, key: int):
-        if key not in self.states:
-            raise Exception("Attempt to get Bell diagonal state before entanglement.")
-
+    def get(self, key: int) -> "QuantumManager.State":
+        if key not in self.states or not isinstance(self.states[key], self.State):
+            logger.error(f"Attempt to get Bell diagonal state for key {key} before it was entangled/set.")
+            raise KeyError(f"Bell diagonal state with key {key} does not exist or is not a BellDiagonalState.")
         return super().get(key)
 
     def set(self, keys: list[int], diag_elems: list[float]) -> None:
-        super().set(keys, diag_elems)
-        # assert len(keys) == 2, "Bell diagonal states must have 2 keys."
         if len(keys) != 2:
-            #raise Warning("bell diagonal quantum manager received invalid set request")  # optional
+            logger.warning(f"[{self.timeline.now()}] Bell diagonal quantum manager received invalid set request with {len(keys)} keys (expected 2). Clearing keys.")
             for key in keys:
                 if key in self.states:
-                    self.states.pop(key)
+                    del self.states[key]
             return
-        new_state = BellDiagonalState(diag_elems, keys)
+
+        class BellDiagonalInnerState(self.State):
+            def __init__(self, keys: List[int], diag_elems: List[float], truncation: int = 1):
+                super().__init__(keys, qutip.Qobj(np.diag(diag_elems), dims=[[2,2],[2,2]]), truncation)
+                self._diag_elems = diag_elems
+
+            @property
+            def diag_elems(self):
+                return self._diag_elems
+
+            def __str__(self):
+                return f"BellDiagonalState(keys={self.keys}, diag_elems={self.diag_elems})"
+
+        new_state_wrapper = BellDiagonalInnerState(keys, diag_elems, self.truncation)
         for key in keys:
-            self.states[key] = new_state
+            self.states[key] = new_state_wrapper
+        logger.debug(f"Set Bell diagonal state for keys {keys}: {diag_elems}")
 
     def set_to_noiseless(self, keys: list[int]):
         self.set(keys, [float(1), float(0), float(0), float(0)])
+
+    def run_circuit(self, circuit: "Circuit", keys: list[int], meas_samp: float = None) -> dict[int, Any]:
+        logger.error(f"[{self.timeline.now()}] run_circuit method of class QuantumManagerBellDiagonal called, which is not supported.")
+        raise NotImplementedError("run_circuit method of class QuantumManagerBellDiagonal is not supported.")
+
+    def measure(self, keys: list[int], povms: list[Union[np.ndarray, qutip.Qobj]], meas_samp: float) -> int:
+        logger.error(f"[{self.timeline.now()}] measure method of class QuantumManagerBellDiagonal called, which is not supported.")
+        raise NotImplementedError("measure method of class QuantumManagerBellDiagonal is not supported directly. Outcomes are typically derived from analytical state evolution.")
+

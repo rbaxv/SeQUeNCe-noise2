@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from ..components.memory import Memory
     from ..components.photon import Photon
     from ..app.request_app import RequestApp
+    from ..components.bsm import BSM
+    from ..components.detector import Detector
 
 from ..kernel.entity import Entity, ClassicalEntity
 from ..components.memory import MemoryArray
@@ -321,30 +323,8 @@ class QuantumRouter(Node):
         self.init_managers(self.memo_arr_name)
         self.map_to_middle_node = {}
         self.app = None
-
-    def receive_message(self, src: str, msg: "Message") -> None:
-        """Determine what to do when a message is received, based on the msg.receiver.
-
-        Args:
-            src (str): name of node that sent the message.
-            msg (Message): the received message.
-        """
-
-        log.logger.info("{} receive message {} from {}".format(self.name, msg, src))
-        if msg.receiver == "network_manager":
-            self.network_manager.received_message(src, msg)
-        elif msg.receiver == "resource_manager":
-            self.resource_manager.received_message(src, msg)
-        else:
-            if msg.receiver is None:  # the msg sent by EntanglementGenerationB doesn't have a receiver (EGA & EGB not paired)
-                matching = [p for p in self.protocols if type(p) == msg.protocol_type]
-                for p in matching:    # the valid_trigger_time() function resolves multiple matching issue
-                    p.received_message(src, msg)
-            else:
-                for protocol in self.protocols:
-                    if protocol.name == msg.receiver:
-                        protocol.received_message(src, msg)
-                        break
+        self.bsms = []  # List to store BSM components
+        self.detectors = []  # List to store standalone detector components
 
     def init_managers(self, memo_arr_name: str):
         """Initialize resource manager and network manager.
@@ -447,6 +427,50 @@ class QuantumRouter(Node):
 
         if self.app:
             self.app.get_other_reservation(reservation)
+
+    def add_bsm(self, bsm: "BSM") -> None:
+        """Add a BSM component to this quantum router.
+        
+        Args:
+            bsm (BSM): The BSM component to add.
+        """
+        self.bsms.append(bsm)
+        bsm.owner = self
+        log.logger.debug(f"Added BSM {bsm.name} to {self.name}")
+
+    def add_detector(self, detector: "Detector") -> None:
+        """Add a detector component to this quantum router.
+        
+        Args:
+            detector (Detector): The detector component to add.
+        """
+        self.detectors.append(detector)
+        detector.owner = self
+        log.logger.debug(f"Added detector {detector.name} to {self.name}")
+
+    def receive_message(self, src: str, msg: "Message") -> None:
+        """Determine what to do when a message is received, based on the msg.receiver.
+
+        Args:
+            src (str): name of node that sent the message.
+            msg (Message): the received message.
+        """
+
+        log.logger.info("{} receive message {} from {}".format(self.name, msg, src))
+        if msg.receiver == "network_manager":
+            self.network_manager.received_message(src, msg)
+        elif msg.receiver == "resource_manager":
+            self.resource_manager.received_message(src, msg)
+        else:
+            if msg.receiver is None:  # the msg sent by EntanglementGenerationB doesn't have a receiver (EGA & EGB not paired)
+                matching = [p for p in self.protocols if type(p) == msg.protocol_type]
+                for p in matching:    # the valid_trigger_time() function resolves multiple matching issue
+                    p.received_message(src, msg)
+            else:
+                for protocol in self.protocols:
+                    if protocol.name == msg.receiver:
+                        protocol.received_message(src, msg)
+                        break
 
 
 class QKDNode(Node):
